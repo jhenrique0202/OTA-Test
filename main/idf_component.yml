@@ -1,0 +1,17 @@
+dependencies:
+  idf:
+    version: 6.0.2
+  espressif/cjson: ^1.7.19~2
+  Salvus-Error:
+    git: git@github.com:salvus-dev/Salvus-Error.git
+    version: v2.2.0
+  Salvus-Logging:
+    git: git@github.com:salvus-dev/Salvus-Logging.git
+    version: v1.0.0
+  Salvus-HAL-NVM:
+    git: git@github.com:salvus-dev/Salvus-HAL-NVM.git
+    version: v1.1.0
+  Salvus-SIMCom:
+    # git: git@github.com:salvus-dev/Salvus-SIMCom.git
+    # version: "feat/Y7080E"
+    path: /home/joaohenrique/Documentos/Salvus/Salvus-SIMCom

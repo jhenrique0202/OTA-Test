@@ -1,0 +1,6 @@
+key,type,encoding,value
+storage,namespace,,
+ota_hostname,data,string,"44.252.15.117"
+ota_server_crt,file,string,../../OTA/server_certificates/ca.pem
+ota_client_crt,file,string,../../OTA/client_certificates/device-0001/device-0001.pem
+ota_client_key,file,string,../../OTA/client_certificates/device-0001/device-0001.key

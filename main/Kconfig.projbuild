@@ -1,0 +1,15 @@
+menu "OTA Test Example"
+    menu "Application"
+        menu "Module"
+            menu "SIMCom Module"
+                choice SIMCOM_MODULE_EXAMPLE_COMMUNICATION_MODULE
+                    prompt "Select communication module"
+                    default USE_Y70XX_SIMCOM_MODULE
+
+                    config USE_Y70XX_SIMCOM_MODULE
+                        bool "Y70XX"
+                endchoice
+            endmenu
+        endmenu
+    endmenu
+endmenu

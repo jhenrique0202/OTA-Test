@@ -1,0 +1,16 @@
+# VSCode
+.devcontainer/
+sdkconfig
+sdkconfig.old
+.vscode/
+
+# Build files
+build/
+managed_components/
+components/
+dependencies.lock
+
+#etc
+credentials/
+
+nvs.bin
