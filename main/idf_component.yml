@@ -12,6 +12,6 @@ dependencies:
     git: git@github.com:salvus-dev/Salvus-HAL-NVM.git
     version: v1.1.0
   Salvus-SIMCom:
-    # git: git@github.com:salvus-dev/Salvus-SIMCom.git
-    # version: "feat/Y7080E"
-    path: /home/joaohenrique/Documentos/Salvus/Salvus-SIMCom
+    git: git@github.com:salvus-dev/Salvus-SIMCom.git
+    version: "feat/Y7080E"
+    # path: /home/joaohenrique/Documentos/Salvus/Salvus-SIMCom
