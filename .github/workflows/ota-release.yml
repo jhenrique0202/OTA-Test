@@ -1,8 +1,10 @@
 # Publica o firmware no servidor OTA da PoC a cada release publicada no GitHub.
 #
+# Job "preparar":  valida a tag e verifica se a release já traz o binário anexado.
 # Job "compilar":  compila no contêiner oficial do ESP-IDF, com acesso de leitura às
-#                  dependências privadas, e confere a versão gravada no binário.
-# Job "publicar":  assina, envia ao S3 e publica na instância via SSM.
+#                  dependências privadas. É PULADO se a release tiver o anexo <APP_NAME>.bin
+#                  (modo provisório: binário compilado localmente).
+# Job "publicar":  confere a versão, assina, envia ao S3 e publica na instância via SSM.
 #                  Só este job tem acesso à chave de assinatura e à AWS.
 #
 # Configuração necessária:
@@ -22,22 +24,18 @@ concurrency:
   cancel-in-progress: false
  
 jobs:
-  compilar:
+  preparar:
     runs-on: ubuntu-latest
-    timeout-minutes: 30          # encerra o job se algo travar
+    timeout-minutes: 5
     permissions:
       contents: read
-    container:
-      image: espressif/idf:${{ vars.ESP_IDF_VERSION }}
-    defaults:
-      run:
-        shell: bash
     env:
       TAG: ${{ github.event.release.tag_name }}
-      PROJECT_DIR: ${{ vars.PROJECT_DIR }}
       APP_NAME: ${{ vars.APP_NAME }}
+      GH_TOKEN: ${{ github.token }}
     outputs:
       versao: ${{ steps.versao.outputs.versao }}
+      binario_anexado: ${{ steps.anexo.outputs.binario_anexado }}
  
     steps:
       - name: Validar a tag e extrair a versão
@@ -48,6 +46,33 @@ jobs:
           fi
           echo "versao=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
  
+      - name: Verificar se o binário foi anexado à release
+        id: anexo
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' \
+               | grep -Fxq "$APP_NAME.bin"; then
+            echo "::warning::Usando o binário $APP_NAME.bin anexado à release (compilação no GitHub ignorada)"
+            echo "binario_anexado=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "binario_anexado=false" >> "$GITHUB_OUTPUT"
+          fi
+ 
+  compilar:
+    needs: preparar
+    if: needs.preparar.outputs.binario_anexado == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30          # encerra o job se algo travar
+    permissions:
+      contents: read
+    container:
+      image: espressif/idf:${{ vars.ESP_IDF_VERSION }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROJECT_DIR: ${{ vars.PROJECT_DIR }}
+ 
+    steps:
       - name: Obter o código da release
         uses: actions/checkout@v4
         with:
@@ -73,11 +98,53 @@ jobs:
           cd "$PROJECT_DIR"
           idf.py build
  
-      - name: Conferir a versão gravada no binário
+      - name: Guardar o binário para o job de publicação
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-nao-assinado
+          path: ${{ vars.PROJECT_DIR }}/build/${{ vars.APP_NAME }}.bin
+          retention-days: 1
+          if-no-files-found: error
+ 
+  publicar:
+    needs: [preparar, compilar]
+    if: >-
+      always() &&
+      needs.preparar.result == 'success' &&
+      (needs.compilar.result == 'success' || needs.compilar.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ota-poc
+    permissions:
+      contents: write    # anexar o binário assinado à release
+      id-token: write    # autenticação na AWS por OIDC, sem chaves de acesso
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      VERSAO: ${{ needs.preparar.outputs.versao }}
+      APP_NAME: ${{ vars.APP_NAME }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.OTA_S3_BUCKET }}
+      INSTANCE_ID: ${{ vars.OTA_INSTANCE_ID }}
+ 
+    steps:
+      - name: Obter o binário compilado no GitHub
+        if: needs.preparar.outputs.binario_anexado == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-nao-assinado
+          path: ${{ runner.temp }}/build
+ 
+      - name: Obter o binário anexado à release
+        if: needs.preparar.outputs.binario_anexado == 'true'
         env:
-          VERSAO: ${{ steps.versao.outputs.versao }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python3 - "$PROJECT_DIR/build/$APP_NAME.bin" "$VERSAO" <<'PY'
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+             --pattern "$APP_NAME.bin" --dir "$RUNNER_TEMP/build"
+ 
+      - name: Conferir a versão gravada no binário
+        run: |
+          python3 - "$RUNNER_TEMP/build/$APP_NAME.bin" "$VERSAO" <<'PY'
           import struct, sys
           dados = open(sys.argv[1], "rb").read(256)
           # esp_app_desc_t fica no início do primeiro segmento (offset 32); versão em +16, 32 bytes
@@ -88,37 +155,6 @@ jobs:
           if versao != sys.argv[2]:
               sys.exit(f"PROJECT_VER ({versao}) difere da tag ({sys.argv[2]})")
           PY
- 
-      - name: Guardar o binário para o job de publicação
-        uses: actions/upload-artifact@v4
-        with:
-          name: firmware-nao-assinado
-          path: ${{ vars.PROJECT_DIR }}/build/${{ vars.APP_NAME }}.bin
-          retention-days: 1
-          if-no-files-found: error
- 
-  publicar:
-    needs: compilar
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment: ota-poc
-    permissions:
-      contents: write    # anexar o binário assinado à release
-      id-token: write    # autenticação na AWS por OIDC, sem chaves de acesso
-    env:
-      TAG: ${{ github.event.release.tag_name }}
-      VERSAO: ${{ needs.compilar.outputs.versao }}
-      APP_NAME: ${{ vars.APP_NAME }}
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      S3_BUCKET: ${{ vars.OTA_S3_BUCKET }}
-      INSTANCE_ID: ${{ vars.OTA_INSTANCE_ID }}
- 
-    steps:
-      - name: Obter o binário compilado
-        uses: actions/download-artifact@v4
-        with:
-          name: firmware-nao-assinado
-          path: ${{ runner.temp }}/build
  
       - name: Assinar o binário
         env:
