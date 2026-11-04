@@ -1,43 +1,45 @@
 # Publica o firmware no servidor OTA da PoC a cada release publicada no GitHub.
-# Fluxo: compila, confere a versão, assina, envia ao S3 e publica na instância via SSM.
-# Configuração necessária (environment "ota-poc"):
-#   secrets:   OTA_SIGNING_KEY  (chave privada de assinatura, PEM)
-#   variables: AWS_REGION, AWS_ROLE_ARN, OTA_S3_BUCKET, OTA_INSTANCE_ID,
-#              ESP_IDF_VERSION (ex.: v5.2.2), IDF_TARGET (ex.: esp32),
-#              PROJECT_DIR (ex.: . ou ATAS-Wearable-Gateway), APP_NAME (nome do project() no CMake)
+#
+# Job "compilar":  compila no contêiner oficial do ESP-IDF, com acesso de leitura às
+#                  dependências privadas, e confere a versão gravada no binário.
+# Job "publicar":  assina, envia ao S3 e publica na instância via SSM.
+#                  Só este job tem acesso à chave de assinatura e à AWS.
+#
+# Configuração necessária:
+#   secret do repositório:            DEPS_READ_TOKEN (token somente leitura dos repositórios das dependências)
+#   variáveis do repositório:         ESP_IDF_VERSION (ex.: v6.0.2), IDF_TARGET (ex.: esp32s3),
+#                                     PROJECT_DIR (ex.: .), APP_NAME (nome do project() no CMake)
+#   environment "ota-poc", secret:    OTA_SIGNING_KEY (chave privada de assinatura, PEM)
+#   environment "ota-poc", variáveis: AWS_REGION, AWS_ROLE_ARN, OTA_S3_BUCKET, OTA_INSTANCE_ID
 name: Publicar firmware OTA
-
+ 
 on:
   release:
     types: [published]
-
-permissions:
-  contents: write    # anexar o binário assinado à release
-  id-token: write    # autenticação na AWS por OIDC, sem chaves de acesso
-
+ 
 concurrency:
   group: ota-publicacao
   cancel-in-progress: false
-
+ 
 jobs:
-  publicar:
+  compilar:
     runs-on: ubuntu-latest
-    environment: ota-poc
+    timeout-minutes: 30          # encerra o job se algo travar
+    permissions:
+      contents: read
+    container:
+      image: espressif/idf:${{ vars.ESP_IDF_VERSION }}
+    defaults:
+      run:
+        shell: bash
     env:
       TAG: ${{ github.event.release.tag_name }}
-      AWS_REGION: ${{ vars.AWS_REGION }}
-      S3_BUCKET: ${{ vars.OTA_S3_BUCKET }}
-      INSTANCE_ID: ${{ vars.OTA_INSTANCE_ID }}
       PROJECT_DIR: ${{ vars.PROJECT_DIR }}
       APP_NAME: ${{ vars.APP_NAME }}
-
+    outputs:
+      versao: ${{ steps.versao.outputs.versao }}
+ 
     steps:
-      - name: Obter o código da release
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.release.tag_name }}
-          submodules: recursive
-
       - name: Validar a tag e extrair a versão
         id: versao
         run: |
@@ -45,21 +47,37 @@ jobs:
             echo "::error::A tag deve seguir o formato vX.Y.Z (recebido: $TAG)"; exit 1
           fi
           echo "versao=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-
-      - name: Compilar com ESP-IDF
-        uses: espressif/esp-idf-ci-action@v1
+ 
+      - name: Obter o código da release
+        uses: actions/checkout@v4
         with:
-          esp_idf_version: ${{ vars.ESP_IDF_VERSION }}
-          target: ${{ vars.IDF_TARGET }}
-          path: ${{ vars.PROJECT_DIR }}
-
+          ref: ${{ github.event.release.tag_name }}
+          submodules: recursive
+ 
+      - name: Compilar com ESP-IDF
+        timeout-minutes: 20
+        env:
+          IDF_TARGET: ${{ vars.IDF_TARGET }}
+          # Reescreve endereços SSH do GitHub para HTTPS com token somente leitura,
+          # sem alterar o idf_component.yml (que continua com SSH para uso local).
+          GIT_CONFIG_COUNT: "2"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.DEPS_READ_TOKEN }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_0: "git@github.com:"
+          GIT_CONFIG_KEY_1: url.https://x-access-token:${{ secrets.DEPS_READ_TOKEN }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_1: "ssh://git@github.com/"
+          GIT_TERMINAL_PROMPT: "0"   # falha em vez de pedir credenciais
+        run: |
+          git config --global --add safe.directory '*'
+          # shellcheck disable=SC1091
+          . "$IDF_PATH/export.sh" > /dev/null
+          cd "$PROJECT_DIR"
+          idf.py build
+ 
       - name: Conferir a versão gravada no binário
         env:
           VERSAO: ${{ steps.versao.outputs.versao }}
         run: |
-          BIN="$PROJECT_DIR/build/$APP_NAME.bin"
-          sudo chown -R "$(id -u)" "$PROJECT_DIR/build"
-          python3 - "$BIN" "$VERSAO" <<'PY'
+          python3 - "$PROJECT_DIR/build/$APP_NAME.bin" "$VERSAO" <<'PY'
           import struct, sys
           dados = open(sys.argv[1], "rb").read(256)
           # esp_app_desc_t fica no início do primeiro segmento (offset 32); versão em +16, 32 bytes
@@ -70,8 +88,38 @@ jobs:
           if versao != sys.argv[2]:
               sys.exit(f"PROJECT_VER ({versao}) difere da tag ({sys.argv[2]})")
           PY
-          echo "BIN=$BIN" >> "$GITHUB_ENV"
-
+ 
+      - name: Guardar o binário para o job de publicação
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-nao-assinado
+          path: ${{ vars.PROJECT_DIR }}/build/${{ vars.APP_NAME }}.bin
+          retention-days: 1
+          if-no-files-found: error
+ 
+  publicar:
+    needs: compilar
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ota-poc
+    permissions:
+      contents: write    # anexar o binário assinado à release
+      id-token: write    # autenticação na AWS por OIDC, sem chaves de acesso
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      VERSAO: ${{ needs.compilar.outputs.versao }}
+      APP_NAME: ${{ vars.APP_NAME }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      S3_BUCKET: ${{ vars.OTA_S3_BUCKET }}
+      INSTANCE_ID: ${{ vars.OTA_INSTANCE_ID }}
+ 
+    steps:
+      - name: Obter o binário compilado
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-nao-assinado
+          path: ${{ runner.temp }}/build
+ 
       - name: Assinar o binário
         env:
           OTA_SIGNING_KEY: ${{ secrets.OTA_SIGNING_KEY }}
@@ -81,29 +129,26 @@ jobs:
           KEY="$RUNNER_TEMP/assinatura.pem"
           printf '%s\n' "$OTA_SIGNING_KEY" > "$KEY"
           trap 'rm -f "$KEY"' EXIT
-          SIGNED="$RUNNER_TEMP/app-${{ steps.versao.outputs.versao }}.bin"
+          BIN="$RUNNER_TEMP/build/$APP_NAME.bin"
+          SIGNED="$RUNNER_TEMP/app-$VERSAO.bin"
           espsecure.py sign_data --version 2 --keyfile "$KEY" --output "$SIGNED" "$BIN"
           espsecure.py verify_signature --version 2 --keyfile "$KEY" "$SIGNED"
           echo "SIGNED=$SIGNED" >> "$GITHUB_ENV"
           echo "SHA256=$(sha256sum "$SIGNED" | cut -d' ' -f1)" >> "$GITHUB_ENV"
-
+ 
       - name: Autenticar na AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-
+ 
       - name: Enviar ao S3
-        env:
-          VERSAO: ${{ steps.versao.outputs.versao }}
         run: |
           KEY_S3="releases/$VERSAO/app-$VERSAO.bin"
           aws s3 cp "$SIGNED" "s3://$S3_BUCKET/$KEY_S3" --only-show-errors
           echo "URL=$(aws s3 presign "s3://$S3_BUCKET/$KEY_S3" --expires-in 900)" >> "$GITHUB_ENV"
-
+ 
       - name: Publicar na instância (SSM)
-        env:
-          VERSAO: ${{ steps.versao.outputs.versao }}
         run: |
           PARAMS=$(jq -n --arg url "$URL" --arg sha "$SHA256" --arg ver "$VERSAO" '{commands: [
             "set -euo pipefail",
@@ -121,8 +166,8 @@ jobs:
             --query '{status: Status, saida: StandardOutputContent, erro: StandardErrorContent}'
           STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" --query Status --output text)
           [ "$STATUS" = "Success" ] || { echo "::error::Publicação na instância falhou ($STATUS)"; exit 1; }
-
+ 
       - name: Anexar o binário assinado à release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" "$SIGNED" --clobber
+        run: gh release upload "$TAG" "$SIGNED" --clobber --repo "$GITHUB_REPOSITORY"
