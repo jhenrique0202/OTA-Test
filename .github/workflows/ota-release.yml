@@ -187,7 +187,7 @@ jobs:
       - name: Publicar na instância (SSM)
         run: |
           PARAMS=$(jq -n --arg url "$URL" --arg sha "$SHA256" --arg ver "$VERSAO" '{commands: [
-            "set -euo pipefail",
+            "set -eu",
             ("test ! -e /var/www/ota/fw/poc/app-" + $ver + ".bin || { echo \"Versão " + $ver + " já publicada\"; exit 1; }"),
             ("curl -fsS -o /tmp/ota-upload.bin \u0027" + $url + "\u0027"),
             ("echo \u0027" + $sha + "  /tmp/ota-upload.bin\u0027 | sha256sum -c -"),
